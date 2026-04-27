@@ -28,6 +28,19 @@ from langchain_community.vectorstores import Chroma
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
+# ==================== EMBEDDINGS ====================
+from langchain_huggingface import HuggingFaceEmbeddings
+
+@st.cache_resource
+def load_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+embedding_model = load_embeddings()
+
 # ==================== CONFIG ====================
 load_dotenv()
 
