@@ -693,29 +693,17 @@ def get_text_chunks(documents):
 def get_vector_store(texts, metadatas):
     """Build ChromaDB vector store."""
     if not texts:
-        raise ValueError("No text content to embed. Check your PDFs.")
+        raise ValueError("No text content to embed.")
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-    # Clean existing directory
-    if os.path.exists(CHROMA_DIR):
-        import shutil
-        try:
-            shutil.rmtree(CHROMA_DIR)
-        except Exception:
-            pass
+    embeddings = embedding_model
 
     vector_store = Chroma.from_texts(
         texts=texts,
         embedding=embeddings,
         metadatas=metadatas,
-        persist_directory=CHROMA_DIR,
         collection_name="multimodal_rag",
     )
+
     return vector_store
 
 
@@ -732,7 +720,6 @@ def reload_vector_store_from_disk():
         )
 
         vs = Chroma(
-            persist_directory=CHROMA_DIR,
             collection_name="multimodal_rag",
             embedding_function=embeddings,
         )
@@ -743,10 +730,6 @@ def reload_vector_store_from_disk():
         pass
     return None
 
-
-# On startup, try to reload existing vector store
-if st.session_state.vector_store is None and os.path.exists(CHROMA_DIR):
-    vs = reload_vector_store_from_disk()
     if vs:
         st.session_state.vector_store = vs
         st.session_state.pdf_processed = True
