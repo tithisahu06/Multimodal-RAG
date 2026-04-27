@@ -1,0 +1,13 @@
+streamlit
+python-dotenv
+pillow
+pymupdf
+requests
+
+langchain
+langchain-community
+langchain-huggingface
+langchain-experimental
+
+chromadb
+sentence-transformers
