@@ -1,4 +1,13 @@
+import sys
+print("Python executable:", sys.executable)
+print("Python path:", sys.path)
 import streamlit as st
+
+st.set_page_config(
+    page_title="Multimodal RAG Chat",
+    page_icon="",
+    layout="wide",
+)
 import os
 import io
 import json
@@ -29,7 +38,9 @@ from langchain_community.vectorstores import Chroma
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # ==================== EMBEDDINGS ====================
-from langchain_huggingface import HuggingFaceEmbeddings
+# (HuggingFaceEmbeddings is already imported above via the try/except fallback —
+# no need to re-import it here. Re-importing unconditionally is what caused the
+# ModuleNotFoundError even when langchain_community's version was installed.)
 
 @st.cache_resource
 def load_embeddings():
@@ -57,13 +68,14 @@ CHROMA_DIR = "chroma_db"
 HISTORY_FILE = "chat_history.json"
 MIN_IMAGE_SIZE = 50  # Skip images smaller than 50x50 px
 
+# ---- Retrieval / similarity-threshold settings ----
+SIMILARITY_SCORE_THRESHOLD = 0.35  # default; tune 0.2-0.5 depending on embedding model
+MAX_RETRIEVED_CHUNKS = 6
+FETCH_K = 20  # candidates pulled before filtering by score
+
 IMAGES_DIR.mkdir(exist_ok=True)
 
-st.set_page_config(
-    page_title="Multimodal RAG Chat (Llama)",
-    page_icon="🧠",
-    layout="wide",
-)
+
 
 # ==================== PREMIUM CSS ====================
 st.markdown("""
@@ -265,7 +277,7 @@ section[data-testid="stSidebar"] .stMarkdown h3 {
     border-top-color: #6366f1 !important;
 }
 
-.stAlert {
+.stAlert {a
     border-radius: 12px;
 }
 
@@ -463,6 +475,7 @@ def init_session_state():
         "processing_stats": None,
         "pdf_processed": False,
         "history_loaded": False,
+        "similarity_threshold": SIMILARITY_SCORE_THRESHOLD,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -770,27 +783,129 @@ def build_conversation_context(history, max_turns=5):
     return "\n".join(parts)
 
 
+def _doc_key(doc):
+    """Build a stable identity key for a Document so we can cross-reference
+    the same chunk across different retrieval calls (MMR vs scored search)."""
+    meta = doc.metadata or {}
+    return (doc.page_content, meta.get("source"), meta.get("page"), meta.get("type"))
+
+
+def _get_scored_candidates(vector_store, question, fetch_k):
+    """Fetch a candidate pool of (Document, relevance_score) pairs, score
+    normalized to 0-1 where higher = more relevant, with fallbacks for
+    older Chroma/LangChain versions."""
+    try:
+        return list(vector_store.similarity_search_with_relevance_scores(question, k=fetch_k))
+    except Exception:
+        try:
+            raw = vector_store.similarity_search_with_score(question, k=fetch_k)
+            return [(doc, 1 - dist) for doc, dist in raw]
+        except Exception:
+            return [(d, 1.0) for d in vector_store.similarity_search(question, k=fetch_k)]
+
+
+def retrieve_with_score_threshold(vector_store, question, threshold=None, k=None, fetch_k=None):
+    """
+    Plain similarity search filtered by a relevance-score threshold (no diversity).
+    Kept as a standalone utility / fallback path.
+
+    Returns a list of (Document, score) tuples, sorted by score descending,
+    truncated to `k` items. Falls back gracefully to the top few results if
+    nothing clears the threshold, so the user still gets an answer instead of
+    a hard "nothing found".
+    """
+    threshold = SIMILARITY_SCORE_THRESHOLD if threshold is None else threshold
+    k = MAX_RETRIEVED_CHUNKS if k is None else k
+    fetch_k = FETCH_K if fetch_k is None else fetch_k
+
+    docs_with_scores = _get_scored_candidates(vector_store, question, fetch_k)
+
+    # Filter by threshold
+    filtered = [(doc, score) for doc, score in docs_with_scores if score >= threshold]
+
+    # Graceful fallback: if the threshold filters out everything, keep the
+    # top few results anyway rather than returning nothing
+    if not filtered and docs_with_scores:
+        docs_with_scores.sort(key=lambda x: x[1], reverse=True)
+        filtered = docs_with_scores[:3]
+
+    filtered.sort(key=lambda x: x[1], reverse=True)
+    return filtered[:k]
+
+
+def retrieve_with_mmr_and_threshold(vector_store, question, threshold=None, k=None, fetch_k=None):
+    """
+    Combines MMR (Maximal Marginal Relevance) diversity selection with a
+    relevance-score threshold cutoff.
+
+    Why both: plain similarity search can return several near-duplicate
+    chunks (e.g. repeated phrasing from the same paragraph) if they all
+    score highly. MMR re-ranks candidates to balance relevance against
+    diversity, so the returned set covers more distinct parts of the
+    document. Layering the score threshold on top of MMR's picks then
+    ensures every chunk that makes it into the prompt is still actually
+    relevant, not just "diverse for diversity's sake".
+
+    Returns a list of (Document, score) tuples, ordered by MMR's
+    diversity-aware ranking (not sorted purely by score), truncated to `k`.
+    """
+    threshold = SIMILARITY_SCORE_THRESHOLD if threshold is None else threshold
+    k = MAX_RETRIEVED_CHUNKS if k is None else k
+    fetch_k = FETCH_K if fetch_k is None else fetch_k
+
+    # Step 1: build a lookup of relevance scores over a candidate pool
+    scored_candidates = _get_scored_candidates(vector_store, question, fetch_k)
+    score_lookup = {_doc_key(doc): score for doc, score in scored_candidates}
+
+    # Step 2: ask MMR for a diversity-optimized ordering over the same pool
+    try:
+        mmr_docs = vector_store.max_marginal_relevance_search(
+            question, k=fetch_k, fetch_k=fetch_k, lambda_mult=0.5
+        )
+    except Exception:
+        # If MMR isn't supported by this vector store, fall back to the
+        # scored candidates in relevance order
+        mmr_docs = [doc for doc, _ in scored_candidates]
+
+    # Step 3: attach each MMR-selected doc to its relevance score
+    mmr_with_scores = []
+    for doc in mmr_docs:
+        score = score_lookup.get(_doc_key(doc), 0.0)
+        mmr_with_scores.append((doc, score))
+
+    # Step 4: filter by threshold, preserving MMR's diversity-aware order
+    filtered = [(doc, score) for doc, score in mmr_with_scores if score >= threshold]
+
+    # Graceful fallback: keep MMR's top picks even if none clear the
+    # threshold, so the user still gets an answer
+    if not filtered and mmr_with_scores:
+        filtered = mmr_with_scores[:3]
+
+    return filtered[:k]
+
+
 def multimodal_query(question, vector_store, chat_history):
     """
-    Retrieve relevant chunks, build a multimodal prompt,
-    and generate an answer with Llama via Groq.
+    Retrieve relevant chunks using MMR (for diversity) filtered by a
+    similarity score threshold (for relevance quality), build a multimodal
+    prompt, and generate an answer with Llama via Groq.
     Returns (answer_text, sources_list, image_paths_list).
     """
-    # Use MMR search for better diversity
-    try:
-        docs = vector_store.max_marginal_relevance_search(question, k=6, fetch_k=20)
-    except Exception:
-        docs = vector_store.similarity_search(question, k=6)
+    threshold = st.session_state.get("similarity_threshold", SIMILARITY_SCORE_THRESHOLD)
 
-    if not docs:
-        return "⚠️ No relevant content found in the uploaded documents.", [], []
+    docs_with_scores = retrieve_with_mmr_and_threshold(
+        vector_store, question, threshold=threshold
+    )
+
+    if not docs_with_scores:
+        return " No relevant content found in the uploaded documents.", [], []
 
     context_parts = []
     sources = []
     image_paths = []
     seen = set()
 
-    for doc in docs:
+    for doc, score in docs_with_scores:
         context_parts.append(doc.page_content)
 
         src = doc.metadata.get("source", "Unknown")
@@ -799,8 +914,8 @@ def multimodal_query(question, vector_store, chat_history):
         key = f"{src}|{page}|{dtype}"
 
         if key not in seen:
-            icon = {"text": "📄", "table": "📊", "image": "🖼️"}.get(dtype, "📄")
-            sources.append(f"{icon} {src} — Page {page}")
+            icon = {"text": "", "table": "", "image": ""}.get(dtype, "")
+            sources.append(f"{icon} {src} — Page {page} (score: {score:.2f})")
             seen.add(key)
 
         img_path = doc.metadata.get("image_path", "")
@@ -873,18 +988,18 @@ with st.sidebar:
                     status_text.text(msg)
 
                 try:
-                    status_text.text("📄 Extracting content & captioning images…")
+                    status_text.text(" Extracting content & captioning images…")
                     documents, images, stats = get_pdf_content(pdf_docs, _progress)
 
                     if not documents:
                         st.error("No content could be extracted from the uploaded PDFs.")
                     else:
-                        status_text.text("✂️ Chunking documents…")
+                        status_text.text(" Chunking documents…")
                         progress_bar.progress(0.80)
                         texts, metadatas = get_text_chunks(documents)
                         stats["chunks"] = len(texts)
 
-                        status_text.text("🧮 Building vector embeddings…")
+                        status_text.text(" Building vector embeddings…")
                         progress_bar.progress(0.90)
                         st.session_state.vector_store = get_vector_store(texts, metadatas)
 
@@ -893,9 +1008,9 @@ with st.sidebar:
                         st.session_state.pdf_processed = True
 
                         progress_bar.progress(1.0)
-                        status_text.text("✅ Complete!")
+                        status_text.text(" Complete!")
                         st.success(
-                            f"✅ Processed {stats['pdfs']} PDF(s)  |  "
+                            f" Processed {stats['pdfs']} PDF(s)  |  "
                             f"{stats['pages']} pages  |  "
                             f"{stats['images']} images  |  "
                             f"{stats['tables']} tables"
@@ -908,11 +1023,27 @@ with st.sidebar:
         else:
             st.warning("Please upload at least one PDF.")
 
+    # ---- Retrieval Settings ----
+    st.markdown("---")
+    st.markdown("###  Retrieval Settings")
+    st.session_state.similarity_threshold = st.slider(
+        "Similarity score threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(st.session_state.get("similarity_threshold", SIMILARITY_SCORE_THRESHOLD)),
+        step=0.05,
+        help=(
+            "Higher = stricter matching, fewer but more relevant chunks retrieved. "
+            "Lower = looser matching, more (possibly less relevant) chunks retrieved. "
+            "Retrieval uses MMR for diversity, then this threshold filters out low-relevance chunks."
+        ),
+    )
+
     # ---- Stats Dashboard ----
     if st.session_state.processing_stats:
         stats = st.session_state.processing_stats
         st.markdown("---")
-        st.markdown("### 📊 Processing Stats")
+        st.markdown("###  Processing Stats")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -945,7 +1076,7 @@ with st.sidebar:
     # ---- Image Gallery ----
     if st.session_state.images:
         st.markdown("---")
-        st.markdown("### 🖼️ Extracted Images")
+        st.markdown("###  Extracted Images")
         img_paths = list(st.session_state.images.keys())
         cols = st.columns(2)
         for i, p in enumerate(img_paths[:6]):
@@ -957,7 +1088,7 @@ with st.sidebar:
 
     # ---- Summarize ----
     st.markdown("---")
-    if st.button("📄 Summarize Documents", use_container_width=True):
+    if st.button(" Summarize Documents", use_container_width=True):
         if st.session_state.vector_store:
             with st.spinner("Generating summary…"):
                 try:
@@ -988,7 +1119,7 @@ with st.sidebar:
                         summary_prompt,
                         images=summary_images if summary_images else None
                     )
-                    st.markdown("### 📋 Document Summary")
+                    st.markdown("###  Document Summary")
                     st.markdown(resp)
                 except Exception as e:
                     st.error(f"Summarization failed: {e}")
@@ -999,13 +1130,13 @@ with st.sidebar:
     st.markdown("---")
     ac1, ac2 = st.columns(2)
     with ac1:
-        if st.button("🗑️ Clear Chat", use_container_width=True):
+        if st.button(" Clear Chat", use_container_width=True):
             st.session_state.chat_history = []
             if os.path.exists(HISTORY_FILE):
                 os.remove(HISTORY_FILE)
             st.rerun()
     with ac2:
-        if st.button("🔄 Reset All", use_container_width=True):
+        if st.button(" Reset All", use_container_width=True):
             import shutil
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
@@ -1029,23 +1160,23 @@ if not st.session_state.chat_history and not st.session_state.pdf_processed:
     st.markdown("""
     <div class="welcome-card">
         <h3>Welcome to Multimodal RAG Chat</h3>
-        <p>Upload PDF documents and ask anything — including questions about
+        <p>Upload PDF documents and ask anything, including questions about
         images, charts, and tables inside them.</p>
         <div class="feature-grid">
             <div class="feature-item">
-                <div class="feature-icon">📄</div>
+                <div class="feature-icon"></div>
                 Text Understanding
             </div>
             <div class="feature-item">
-                <div class="feature-icon">🖼️</div>
+                <div class="feature-icon"></div>
                 Image Analysis
             </div>
             <div class="feature-item">
-                <div class="feature-icon">📊</div>
+                <div class="feature-icon"></div>
                 Table Extraction
             </div>
             <div class="feature-item">
-                <div class="feature-icon">💬</div>
+                <div class="feature-icon"></div>
                 Multi-turn Chat
             </div>
         </div>
@@ -1054,13 +1185,13 @@ if not st.session_state.chat_history and not st.session_state.pdf_processed:
 
 elif st.session_state.pdf_processed and not st.session_state.chat_history:
     pass
-    
+
 
 for chat in st.session_state.chat_history:
-    with st.chat_message("user", avatar="🧑"):
+    with st.chat_message("user", avatar="👤"):
         st.markdown(chat["question"])
 
-    with st.chat_message("assistant", avatar="🦙"):
+    with st.chat_message("assistant", avatar="🤖"):
         st.markdown(chat["answer"])
 
         img_paths = chat.get("image_paths", [])
@@ -1075,13 +1206,13 @@ for chat in st.session_state.chat_history:
 
         sources = chat.get("sources", [])
         if sources:
-            with st.expander("📚 View Sources", expanded=False):
+            with st.expander(" View Sources", expanded=False):
                 html = "".join(f'<span class="source-badge">{s}</span>' for s in sources)
                 st.markdown(html, unsafe_allow_html=True)
 
         ts = chat.get("timestamp", "")
         if ts:
-            st.caption(f"🕐 {ts}")
+            st.caption(f" {ts}")
 
 
 # ==================== CHAT INPUT ====================
@@ -1089,12 +1220,12 @@ user_question = st.chat_input("Ask anything about your documents…")
 
 if user_question:
     if st.session_state.vector_store is None:
-        st.warning("⚠️ Please upload and process PDF documents first.")
+        st.warning(" Please upload and process PDF documents first.")
     else:
-        with st.chat_message("user", avatar="🧑"):
+        with st.chat_message("user", avatar="👤"):
             st.markdown(user_question)
 
-        with st.chat_message("assistant", avatar="🧠"):
+        with st.chat_message("assistant", avatar="🤖"):
             with st.spinner("Thinking…"):
                 response, sources, image_paths = multimodal_query(
                     user_question,
@@ -1114,12 +1245,12 @@ if user_question:
                             st.image(p, use_container_width=True)
 
             if sources:
-                with st.expander("📚 View Sources", expanded=False):
+                with st.expander(" View Sources", expanded=False):
                     html = "".join(f'<span class="source-badge">{s}</span>' for s in sources)
                     st.markdown(html, unsafe_allow_html=True)
 
             timestamp = datetime.now().strftime("%I:%M %p")
-            st.caption(f"🕐 {timestamp}")
+            st.caption(f" {timestamp}")
 
         st.session_state.chat_history.append({
             "question": user_question,
